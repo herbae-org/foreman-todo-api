@@ -1,0 +1,308 @@
+name: '[AUTOAGENT] Board Sync'
+
+on:
+  pull_request:
+    types: [opened, closed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    # Only for autoagent branches.
+    # NOTE: Job-level `if:` expressions cannot reference env vars, so the branch
+    # prefix is hardcoded here. If you change branch.prefix in autoagent-config.yml,
+    # update this expression too.
+    if: startsWith(github.head_ref, 'autoagent/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+        with: {sparse-checkout: .github, sparse-checkout-cone-mode: false}
+
+      - uses: ./.github/actions/autoagent-setup
+
+      - name: Extract issue number from branch
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          # Route github.head_ref through env to avoid script injection via branch name.
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          # Extract issue number from branch name: autoagent/353-wire-categorization-rules → 353
+          ISSUE_NUM=$(echo "$BRANCH" | sed "s|${AUTOAGENT_BRANCH_PREFIX}||" | grep -oE '^[0-9]+')
+          echo "number=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+          echo "Issue: #$ISSUE_NUM from branch: $BRANCH"
+
+      - name: Get project item ID
+        id: project
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+
+          # Get project item ID for this issue, paginating until found.
+          HAS_NEXT="true"
+          CURSOR=""
+          ITEM_ID=""
+          PROJECT_ID=""
+          FIELD_ID=""
+          READY_FOR_QA_ID=""
+          DONE_ID=""
+
+          while [ "$HAS_NEXT" = "true" ]; do
+            if [ -z "$CURSOR" ]; then
+              CURSOR_ARG="null"
+            else
+              CURSOR_ARG="\"$CURSOR\""
+            fi
+
+            PAGE_DATA=$(gh api graphql -f query="
+              query {
+                organization(login: \"${AUTOAGENT_ORG}\") {
+                  projectV2(number: ${AUTOAGENT_PROJECT_NUMBER}) {
+                    id
+                    items(first: 100, after: ${CURSOR_ARG}) {
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                      nodes {
+                        id
+                        content {
+                          ... on Issue {
+                            number
+                          }
+                        }
+                      }
+                    }
+                    field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        options { id name }
+                      }
+                    }
+                  }
+                }
+              }
+            ")
+
+            if [ -z "$PROJECT_ID" ]; then
+              PROJECT_ID=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.id')
+              FIELD_ID=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.field.id')
+              READY_FOR_QA_ID=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.field.options[] | select(.name == \"${AUTOAGENT_COL_READY_FOR_QA}\") | .id")
+              DONE_ID=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.field.options[] | select(.name == \"${AUTOAGENT_COL_DONE}\") | .id")
+            fi
+
+            FOUND=$(echo "$PAGE_DATA" | jq -r ".data.organization.projectV2.items.nodes[] | select(.content.number == ${ISSUE_NUM}) | .id")
+            if [ -n "$FOUND" ]; then
+              ITEM_ID="$FOUND"
+              break
+            fi
+
+            HAS_NEXT=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.hasNextPage')
+            CURSOR=$(echo "$PAGE_DATA" | jq -r '.data.organization.projectV2.items.pageInfo.endCursor')
+          done
+
+          # Validate that the issue was found on the board and all required field IDs resolved.
+          if [ -z "$ITEM_ID" ] || [ "$ITEM_ID" = "null" ]; then
+            echo "::error::Issue #$ISSUE_NUM not found on project board (org=$AUTOAGENT_ORG, project=$AUTOAGENT_PROJECT_NUMBER)"
+            exit 1
+          fi
+          if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" = "null" ]; then
+            echo "::error::Board misconfigured: PROJECT_ID=$PROJECT_ID"
+            exit 1
+          fi
+          if [ -z "$FIELD_ID" ] || [ "$FIELD_ID" = "null" ]; then
+            echo "::error::Board misconfigured: FIELD_ID=$FIELD_ID (check AUTOAGENT_STATUS_FIELD='$AUTOAGENT_STATUS_FIELD')"
+            exit 1
+          fi
+          if [ -z "$READY_FOR_QA_ID" ] || [ "$READY_FOR_QA_ID" = "null" ]; then
+            echo "::error::Board misconfigured: READY_FOR_QA_ID=$READY_FOR_QA_ID (check AUTOAGENT_COL_READY_FOR_QA='$AUTOAGENT_COL_READY_FOR_QA')"
+            exit 1
+          fi
+          if [ -z "$DONE_ID" ] || [ "$DONE_ID" = "null" ]; then
+            echo "::error::Board misconfigured: DONE_ID=$DONE_ID (check AUTOAGENT_COL_DONE='$AUTOAGENT_COL_DONE')"
+            exit 1
+          fi
+
+          echo "projectId=$PROJECT_ID" >> "$GITHUB_OUTPUT"
+          echo "fieldId=$FIELD_ID" >> "$GITHUB_OUTPUT"
+          echo "itemId=$ITEM_ID" >> "$GITHUB_OUTPUT"
+          echo "readyForQaId=$READY_FOR_QA_ID" >> "$GITHUB_OUTPUT"
+          echo "doneId=$DONE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Move to READY FOR QA (on PR opened)
+        if: github.event.action == 'opened'
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          echo "PR opened for #${ISSUE_NUM}  - moving to READY FOR QA"
+
+          gh api graphql -f query="
+            mutation {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: \"${{ steps.project.outputs.projectId }}\"
+                itemId: \"${{ steps.project.outputs.itemId }}\"
+                fieldId: \"${{ steps.project.outputs.fieldId }}\"
+                value: { singleSelectOptionId: \"${{ steps.project.outputs.readyForQaId }}\" }
+              }) {
+                projectV2Item { id }
+              }
+            }
+          "
+
+          echo "#${ISSUE_NUM} → READY FOR QA"
+
+          # Notify via configured provider
+          NOTIFY_MSG=$(printf 'PR ready for QA: #%s\n%s\n%s' "$ISSUE_NUM" "$PR_TITLE" "$PR_URL")
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              if [ -z "$SLACK_WEBHOOK_URL" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL:   ${{ github.event.pull_request.html_url }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Move to DONE (on PR merged)
+        if: github.event.action == 'closed' && github.event.pull_request.merged == true
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          echo "PR merged for #${ISSUE_NUM}  - moving to DONE"
+
+          gh api graphql -f query="
+            mutation {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: \"${{ steps.project.outputs.projectId }}\"
+                itemId: \"${{ steps.project.outputs.itemId }}\"
+                fieldId: \"${{ steps.project.outputs.fieldId }}\"
+                value: { singleSelectOptionId: \"${{ steps.project.outputs.doneId }}\" }
+              }) {
+                projectV2Item { id }
+              }
+            }
+          "
+
+          echo "#${ISSUE_NUM} → DONE"
+
+          # Notify via configured provider
+          NOTIFY_MSG="Merged and done: #${ISSUE_NUM} - ${PR_TITLE}"
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              if [ -z "$SLACK_WEBHOOK_URL" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL:   ${{ github.event.pull_request.html_url }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Move back to TODO (on PR closed without merge)
+        if: github.event.action == 'closed' && github.event.pull_request.merged == false
+        run: |
+          ISSUE_NUM="${{ steps.issue.outputs.number }}"
+          echo "PR closed without merge for #${ISSUE_NUM}  - moving back to TODO"
+
+          TODO_ID=$(gh api graphql -f query="
+            query {
+              node(id: \"${{ steps.project.outputs.projectId }}\") {
+                ... on ProjectV2 {
+                  field(name: \"${AUTOAGENT_STATUS_FIELD}\") {
+                    ... on ProjectV2SingleSelectField {
+                      options { id name }
+                    }
+                  }
+                }
+              }
+            }
+          " --jq ".data.node.field.options[] | select(.name == \"${AUTOAGENT_COL_TODO}\") | .id")
+
+          gh api graphql -f query="
+            mutation {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: \"${{ steps.project.outputs.projectId }}\"
+                itemId: \"${{ steps.project.outputs.itemId }}\"
+                fieldId: \"${{ steps.project.outputs.fieldId }}\"
+                value: { singleSelectOptionId: \"${TODO_ID}\" }
+              }) {
+                projectV2Item { id }
+              }
+            }
+          "
+
+          echo "#${ISSUE_NUM} → TODO"
+
+          # Notify via configured provider
+          NOTIFY_MSG="PR closed without merge: #${ISSUE_NUM} - back to TODO"
+          case "${AUTOAGENT_NOTIFY_PROVIDER:-none}" in
+            telegram)
+              if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+                echo "notify: telegram secrets missing — skipping"
+              else
+                curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+                  --data-urlencode "text=${NOTIFY_MSG}" >/dev/null 2>&1 || true
+              fi
+              ;;
+            slack)
+              if [ -z "$SLACK_WEBHOOK_URL" ]; then
+                echo "notify: slack webhook missing — skipping"
+              else
+                jq -n --arg t "$NOTIFY_MSG" '{text:$t}' | \
+                  curl -sS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
+              fi
+              ;;
+            *)
+              echo "notify: provider=${AUTOAGENT_NOTIFY_PROVIDER:-none}, skipping"
+              ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
