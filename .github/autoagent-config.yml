@@ -6,7 +6,7 @@
 github:
   organization: "herbae-org"                     # org or user that owns the Projects V2 board
   repository: "herbae-org/foreman-todo-api"      # full OWNER/NAME
-  project_number: 0                              # TODO: set to the board number once created
+  project_number: 3                              # Projects V2 board "Foreman TODO API"
 
 board:
   status_field: "Status"
