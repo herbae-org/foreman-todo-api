@@ -13,6 +13,7 @@ from todo_api.auth import (
     verify_password,
 )
 from todo_api.db import _row_to_tag, _row_to_todo, get_connection, get_tags_for_todo, init_schema
+from todo_api.rate_limit import anon_rate_limit, authed_rate_limit
 
 
 @asynccontextmanager
@@ -104,7 +105,7 @@ class TodoStats(BaseModel):
 # --- Auth endpoints ---
 
 @app.post("/auth/register", status_code=201)
-def register(body: UserCreate) -> UserResponse:
+def register(body: UserCreate, _: str = Depends(anon_rate_limit)) -> UserResponse:
     conn = get_connection()
     now = datetime.now(timezone.utc)
     hashed = hash_password(body.password)
@@ -123,7 +124,7 @@ def register(body: UserCreate) -> UserResponse:
 
 
 @app.post("/auth/login")
-def login(body: LoginRequest) -> LoginResponse:
+def login(body: LoginRequest, _: str = Depends(anon_rate_limit)) -> LoginResponse:
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM users WHERE email = ?", (body.email,)
@@ -138,7 +139,7 @@ def login(body: LoginRequest) -> LoginResponse:
 
 
 @app.get("/auth/me")
-def get_me(user_id: int = Depends(get_current_user)) -> UserResponse:
+def get_me(user_id: int = Depends(authed_rate_limit)) -> UserResponse:
     conn = get_connection()
     row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     conn.close()
@@ -159,7 +160,7 @@ def health() -> dict[str, str]:
 # --- Todo endpoints ---
 
 @app.post("/todos", status_code=201)
-def create_todo(body: TodoCreate, user_id: int = Depends(get_current_user)) -> Todo:
+def create_todo(body: TodoCreate, user_id: int = Depends(authed_rate_limit)) -> Todo:
     now = datetime.now(timezone.utc)
     conn = get_connection()
     cursor = conn.execute(
@@ -177,7 +178,7 @@ def create_todo(body: TodoCreate, user_id: int = Depends(get_current_user)) -> T
 
 @app.get("/todos")
 def list_todos(
-    user_id: int = Depends(get_current_user),
+    user_id: int = Depends(authed_rate_limit),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     done: bool | None = Query(default=None),
@@ -212,7 +213,7 @@ def list_todos(
 
 
 @app.get("/todos/stats")
-def get_stats(user_id: int = Depends(get_current_user)) -> TodoStats:
+def get_stats(user_id: int = Depends(authed_rate_limit)) -> TodoStats:
     conn = get_connection()
     row = conn.execute(
         "SELECT COUNT(*) AS total, SUM(done) AS done FROM todos WHERE user_id = ?",
@@ -225,7 +226,7 @@ def get_stats(user_id: int = Depends(get_current_user)) -> TodoStats:
 
 
 @app.get("/todos/{todo_id}")
-def get_todo(todo_id: int, user_id: int = Depends(get_current_user)) -> Todo:
+def get_todo(todo_id: int, user_id: int = Depends(authed_rate_limit)) -> Todo:
     conn = get_connection()
     row = conn.execute(
         "SELECT * FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
@@ -240,7 +241,7 @@ def get_todo(todo_id: int, user_id: int = Depends(get_current_user)) -> Todo:
 
 @app.patch("/todos/{todo_id}")
 def patch_todo(
-    todo_id: int, body: PatchTodo, user_id: int = Depends(get_current_user)
+    todo_id: int, body: PatchTodo, user_id: int = Depends(authed_rate_limit)
 ) -> Todo:
     conn = get_connection()
     done_val = int(body.done) if body.done is not None else None
@@ -262,7 +263,7 @@ def patch_todo(
 
 
 @app.delete("/todos/{todo_id}", status_code=204)
-def delete_todo(todo_id: int, user_id: int = Depends(get_current_user)) -> Response:
+def delete_todo(todo_id: int, user_id: int = Depends(authed_rate_limit)) -> Response:
     conn = get_connection()
     cursor = conn.execute(
         "DELETE FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
@@ -277,7 +278,7 @@ def delete_todo(todo_id: int, user_id: int = Depends(get_current_user)) -> Respo
 # --- Tag endpoints ---
 
 @app.post("/tags", status_code=201)
-def create_tag(body: TagCreate, user_id: int = Depends(get_current_user)) -> Tag:
+def create_tag(body: TagCreate, user_id: int = Depends(authed_rate_limit)) -> Tag:
     conn = get_connection()
     try:
         cursor = conn.execute(
@@ -295,7 +296,7 @@ def create_tag(body: TagCreate, user_id: int = Depends(get_current_user)) -> Tag
 
 
 @app.get("/tags")
-def list_tags(user_id: int = Depends(get_current_user)) -> TagList:
+def list_tags(user_id: int = Depends(authed_rate_limit)) -> TagList:
     conn = get_connection()
     rows = conn.execute(
         "SELECT * FROM tags WHERE user_id = ? ORDER BY id DESC", (user_id,)
@@ -305,7 +306,7 @@ def list_tags(user_id: int = Depends(get_current_user)) -> TagList:
 
 
 @app.delete("/tags/{tag_id}", status_code=204)
-def delete_tag(tag_id: int, user_id: int = Depends(get_current_user)) -> Response:
+def delete_tag(tag_id: int, user_id: int = Depends(authed_rate_limit)) -> Response:
     conn = get_connection()
     cursor = conn.execute(
         "DELETE FROM tags WHERE id = ? AND user_id = ?", (tag_id, user_id)
@@ -321,7 +322,7 @@ def delete_tag(tag_id: int, user_id: int = Depends(get_current_user)) -> Respons
 
 @app.post("/todos/{todo_id}/tags")
 def assign_tags(
-    todo_id: int, body: TagAssign, user_id: int = Depends(get_current_user)
+    todo_id: int, body: TagAssign, user_id: int = Depends(authed_rate_limit)
 ) -> Todo:
     conn = get_connection()
     row = conn.execute(
@@ -352,7 +353,7 @@ def assign_tags(
 
 @app.delete("/todos/{todo_id}/tags/{tag_id}", status_code=204)
 def remove_tag(
-    todo_id: int, tag_id: int, user_id: int = Depends(get_current_user)
+    todo_id: int, tag_id: int, user_id: int = Depends(authed_rate_limit)
 ) -> Response:
     conn = get_connection()
     todo_row = conn.execute(
