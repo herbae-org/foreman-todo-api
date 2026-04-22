@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from todo_api import db as db_module
 from todo_api import rate_limit
+from todo_api.events import bus
 from todo_api.app import app
 
 
@@ -18,6 +19,7 @@ async def isolated_state(tmp_path, monkeypatch):
     finally:
         await conn.close()
     rate_limit.reset_buckets()
+    bus.reset()
 
 
 @pytest.fixture
