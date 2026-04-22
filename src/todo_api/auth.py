@@ -4,9 +4,9 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 
+import bcrypt
 import jwt
 from fastapi import Header, HTTPException
-from passlib.context import CryptContext
 
 from todo_api.db import get_connection
 
@@ -22,15 +22,12 @@ else:
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_SECONDS = 3600
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
 def hash_password(plain: str) -> str:
-    return _pwd_ctx.hash(plain)
+    return bcrypt.hashpw(plain.encode("utf-8"), bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    return bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("ascii"))
 
 
 def create_token(user_id: int) -> str:
