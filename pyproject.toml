@@ -11,7 +11,7 @@ dependencies = [
     "pydantic[email]>=2.6",
     "bcrypt>=4.0",
     "pyjwt>=2.8",
-    "aiosqlite>=0.19",
+    "asyncpg>=0.29",
 ]
 
 [project.optional-dependencies]

@@ -9,7 +9,7 @@ import jwt
 from fastapi import Header, HTTPException, WebSocket, status
 from fastapi.exceptions import WebSocketException
 
-from todo_api.db import get_connection
+from todo_api.db import get_pool
 
 _TESTING = "pytest" in sys.modules or "PYTEST_CURRENT_TEST" in os.environ
 
@@ -52,12 +52,8 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
         user_id = decode_token(token)
     except (jwt.InvalidTokenError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
-    conn = await get_connection()
-    try:
-        cursor = await conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        row = await cursor.fetchone()
-    finally:
-        await conn.close()
+    pool = await get_pool()
+    row = await pool.fetchrow("SELECT id FROM users WHERE id = $1", user_id)
     if row is None:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
     return user_id

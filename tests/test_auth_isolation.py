@@ -94,23 +94,19 @@ async def test_deleting_user_cascades_todos_and_tags() -> None:
     _create_todo("t2", h)
     _create_tag("tag1", h)
 
-    conn = await db_module.get_connection()
-    try:
-        cursor = await conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1")
-        user_row = await cursor.fetchone()
+    pool = await db_module.get_pool()
+    async with pool.acquire() as conn:
+        user_row = await conn.fetchrow("SELECT id FROM users ORDER BY id DESC LIMIT 1")
         user_id = user_row["id"]
 
-        cursor = await conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,))
-        assert (await cursor.fetchone())[0] == 2
-        cursor = await conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,))
-        assert (await cursor.fetchone())[0] == 1
+        row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM todos WHERE user_id = $1", user_id)
+        assert row["cnt"] == 2
+        row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM tags WHERE user_id = $1", user_id)
+        assert row["cnt"] == 1
 
-        await conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        await conn.commit()
+        await conn.execute("DELETE FROM users WHERE id = $1", user_id)
 
-        cursor = await conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,))
-        assert (await cursor.fetchone())[0] == 0
-        cursor = await conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,))
-        assert (await cursor.fetchone())[0] == 0
-    finally:
-        await conn.close()
+        row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM todos WHERE user_id = $1", user_id)
+        assert row["cnt"] == 0
+        row = await conn.fetchrow("SELECT COUNT(*) AS cnt FROM tags WHERE user_id = $1", user_id)
+        assert row["cnt"] == 0

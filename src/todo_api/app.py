@@ -2,7 +2,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-import aiosqlite
+import asyncpg
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, EmailStr, Field
 
@@ -16,10 +16,12 @@ from todo_api.auth import (
 )
 from todo_api.events import bus
 from todo_api.db import (
-    IntegrityError,
+    _delete_affected,
     _row_to_tag,
     _row_to_todo,
-    get_connection,
+    close_pool,
+    get_db,
+    get_pool,
     get_tags_for_todo,
     init_schema,
 )
@@ -28,21 +30,14 @@ from todo_api.rate_limit import anon_rate_limit, authed_rate_limit
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    conn = await get_connection()
-    await init_schema(conn)
-    await conn.close()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await init_schema(conn)
     yield
+    await close_pool()
 
 
 app = FastAPI(lifespan=lifespan)
-
-
-async def get_db() -> AsyncIterator[aiosqlite.Connection]:
-    conn = await get_connection()
-    try:
-        yield conn
-    finally:
-        await conn.close()
 
 
 # --- Auth models ---
@@ -126,32 +121,30 @@ class TodoStats(BaseModel):
 async def register(
     body: UserCreate,
     _: str = Depends(anon_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> UserResponse:
     now = datetime.now(timezone.utc)
     hashed = hash_password(body.password)
     try:
-        cursor = await conn.execute(
-            "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
-            (body.email, hashed, now.isoformat()),
+        row = await conn.fetchrow(
+            "INSERT INTO users (email, password_hash, created_at) "
+            "VALUES (LOWER($1), $2, $3) RETURNING id, email, created_at",
+            body.email, hashed, now,
         )
-        await conn.commit()
-    except IntegrityError:
+    except asyncpg.UniqueViolationError:
         raise HTTPException(status_code=409, detail="Email already registered")
-    user_id = cursor.lastrowid
-    return UserResponse(id=user_id, email=body.email, created_at=now)
+    return UserResponse(id=row["id"], email=row["email"], created_at=row["created_at"])
 
 
 @app.post("/auth/login")
 async def login(
     body: LoginRequest,
     _: str = Depends(anon_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> LoginResponse:
-    cursor = await conn.execute(
-        "SELECT * FROM users WHERE email = ?", (body.email,)
+    row = await conn.fetchrow(
+        "SELECT * FROM users WHERE LOWER(email) = LOWER($1)", body.email,
     )
-    row = await cursor.fetchone()
     if row is None or not verify_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_token(row["id"])
@@ -163,14 +156,13 @@ async def login(
 @app.get("/auth/me")
 async def get_me(
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> UserResponse:
-    cursor = await conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    row = await cursor.fetchone()
+    row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
     return UserResponse(
         id=row["id"],
         email=row["email"],
-        created_at=datetime.fromisoformat(row["created_at"]),
+        created_at=row["created_at"],
     )
 
 
@@ -187,18 +179,14 @@ async def health() -> dict[str, str]:
 async def create_todo(
     body: TodoCreate,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Todo:
     now = datetime.now(timezone.utc)
-    cursor = await conn.execute(
-        "INSERT INTO todos (user_id, title, done, created_at) VALUES (?, ?, 0, ?)",
-        (user_id, body.title, now.isoformat()),
+    row = await conn.fetchrow(
+        "INSERT INTO todos (user_id, title, done, created_at) "
+        "VALUES ($1, $2, FALSE, $3) RETURNING *",
+        user_id, body.title, now,
     )
-    await conn.commit()
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ?", (cursor.lastrowid,)
-    )
-    row = await cursor.fetchone()
     tags = await get_tags_for_todo(conn, row["id"])
     todo = _row_to_todo(row, tags)
     await bus.publish(user_id, {"type": "created", "todo": todo.model_dump(mode="json")})
@@ -208,37 +196,54 @@ async def create_todo(
 @app.get("/todos")
 async def list_todos(
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     done: bool | None = Query(default=None),
     tag_ids: list[int] | None = Query(default=None),
 ) -> TodoList:
-    done_val = int(done) if done is not None else None
-    has_tag_filter = int(bool(tag_ids))
-    placeholders = ",".join("?" * len(tag_ids)) if tag_ids else "NULL"
-    tag_params = list(tag_ids) if tag_ids else []
+    has_tag_filter = bool(tag_ids)
+    tag_list = tag_ids if tag_ids else []
 
-    cursor = await conn.execute(
+    params: list[object] = [user_id]
+    idx = 2
+
+    if done is not None:
+        done_clause = f"AND t.done = ${idx}"
+        params.append(done)
+        idx += 1
+    else:
+        done_clause = ""
+
+    if has_tag_filter:
+        placeholders = ", ".join(f"${idx + i}" for i in range(len(tag_list)))
+        tag_clause = f"AND tt.tag_id IN ({placeholders})"
+        params.extend(tag_list)
+        idx += len(tag_list)
+    else:
+        tag_clause = ""
+
+    params.extend([limit, offset])
+    limit_idx = idx
+    offset_idx = idx + 1
+
+    rows = await conn.fetch(
         "SELECT DISTINCT t.* FROM todos t "
         "LEFT JOIN todo_tags tt ON tt.todo_id = t.id "
-        f"WHERE t.user_id = ? "
-        f"  AND (? IS NULL OR t.done = ?) "
-        f"  AND (? = 0 OR tt.tag_id IN ({placeholders})) "
-        "ORDER BY t.id DESC LIMIT ? OFFSET ?",
-        [user_id, done_val, done_val, has_tag_filter] + tag_params + [limit, offset],
+        f"WHERE t.user_id = $1 {done_clause} {tag_clause} "
+        f"ORDER BY t.id DESC LIMIT ${limit_idx} OFFSET ${offset_idx}",
+        *params,
     )
-    rows = await cursor.fetchall()
-    cursor = await conn.execute(
-        "SELECT COUNT(DISTINCT t.id) FROM todos t "
+
+    count_params = params[:-2]
+    count_row = await conn.fetchrow(
+        "SELECT COUNT(DISTINCT t.id) AS cnt FROM todos t "
         "LEFT JOIN todo_tags tt ON tt.todo_id = t.id "
-        f"WHERE t.user_id = ? "
-        f"  AND (? IS NULL OR t.done = ?) "
-        f"  AND (? = 0 OR tt.tag_id IN ({placeholders}))",
-        [user_id, done_val, done_val, has_tag_filter] + tag_params,
+        f"WHERE t.user_id = $1 {done_clause} {tag_clause}",
+        *count_params,
     )
-    total_row = await cursor.fetchone()
-    total = total_row[0]
+    total = count_row["cnt"]
+
     items = []
     for r in rows:
         tags = await get_tags_for_todo(conn, r["id"])
@@ -249,15 +254,16 @@ async def list_todos(
 @app.get("/todos/stats")
 async def get_stats(
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> TodoStats:
-    cursor = await conn.execute(
-        "SELECT COUNT(*) AS total, SUM(done) AS done FROM todos WHERE user_id = ?",
-        (user_id,),
+    row = await conn.fetchrow(
+        "SELECT COUNT(*) AS total, "
+        "COUNT(*) FILTER (WHERE done) AS done "
+        "FROM todos WHERE user_id = $1",
+        user_id,
     )
-    row = await cursor.fetchone()
     total = row["total"]
-    done_count = row["done"] or 0
+    done_count = row["done"]
     return TodoStats(total=total, done=done_count, pending=total - done_count)
 
 
@@ -265,12 +271,11 @@ async def get_stats(
 async def get_todo(
     todo_id: int,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Todo:
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+    row = await conn.fetchrow(
+        "SELECT * FROM todos WHERE id = $1 AND user_id = $2", todo_id, user_id,
     )
-    row = await cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Not Found")
     tags = await get_tags_for_todo(conn, row["id"])
@@ -282,21 +287,19 @@ async def patch_todo(
     todo_id: int,
     body: PatchTodo,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Todo:
-    done_val = int(body.done) if body.done is not None else None
-    cursor = await conn.execute(
-        "UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) "
-        "WHERE id = ? AND user_id = ?",
-        (body.title, done_val, todo_id, user_id),
+    affected = await _delete_affected(
+        conn,
+        "UPDATE todos SET title = COALESCE($1, title), done = COALESCE($2, done) "
+        "WHERE id = $3 AND user_id = $4",
+        body.title, body.done, todo_id, user_id,
     )
-    await conn.commit()
-    if cursor.rowcount == 0:
+    if affected == 0:
         raise HTTPException(status_code=404, detail="Not Found")
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ?", (todo_id,)
+    row = await conn.fetchrow(
+        "SELECT * FROM todos WHERE id = $1", todo_id,
     )
-    row = await cursor.fetchone()
     tags = await get_tags_for_todo(conn, row["id"])
     todo = _row_to_todo(row, tags)
     await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})
@@ -307,20 +310,16 @@ async def patch_todo(
 async def delete_todo(
     todo_id: int,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Response:
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+    row = await conn.fetchrow(
+        "SELECT * FROM todos WHERE id = $1 AND user_id = $2", todo_id, user_id,
     )
-    row = await cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Not Found")
     tags = await get_tags_for_todo(conn, row["id"])
     pre_delete_todo = _row_to_todo(row, tags)
-    await conn.execute(
-        "DELETE FROM todos WHERE id = ?", (todo_id,)
-    )
-    await conn.commit()
+    await conn.execute("DELETE FROM todos WHERE id = $1", todo_id)
     await bus.publish(user_id, {"type": "deleted", "todo": pre_delete_todo.model_dump(mode="json")})
     return Response(status_code=204)
 
@@ -331,31 +330,26 @@ async def delete_todo(
 async def create_tag(
     body: TagCreate,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Tag:
     try:
-        cursor = await conn.execute(
-            "INSERT INTO tags (user_id, name) VALUES (?, ?)", (user_id, body.name)
+        row = await conn.fetchrow(
+            "INSERT INTO tags (user_id, name) VALUES ($1, $2) RETURNING id, name",
+            user_id, body.name,
         )
-        await conn.commit()
-    except IntegrityError:
+    except asyncpg.UniqueViolationError:
         raise HTTPException(status_code=409, detail="Tag already exists")
-    cursor = await conn.execute(
-        "SELECT * FROM tags WHERE id = ?", (cursor.lastrowid,)
-    )
-    row = await cursor.fetchone()
     return _row_to_tag(row)
 
 
 @app.get("/tags")
 async def list_tags(
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> TagList:
-    cursor = await conn.execute(
-        "SELECT * FROM tags WHERE user_id = ? ORDER BY id DESC", (user_id,)
+    rows = await conn.fetch(
+        "SELECT * FROM tags WHERE user_id = $1 ORDER BY id DESC", user_id,
     )
-    rows = await cursor.fetchall()
     return TagList(items=[_row_to_tag(r) for r in rows], total=len(rows))
 
 
@@ -363,13 +357,13 @@ async def list_tags(
 async def delete_tag(
     tag_id: int,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Response:
-    cursor = await conn.execute(
-        "DELETE FROM tags WHERE id = ? AND user_id = ?", (tag_id, user_id)
+    affected = await _delete_affected(
+        conn,
+        "DELETE FROM tags WHERE id = $1 AND user_id = $2", tag_id, user_id,
     )
-    await conn.commit()
-    if cursor.rowcount == 0:
+    if affected == 0:
         raise HTTPException(status_code=404, detail="Not Found")
     return Response(status_code=204)
 
@@ -381,29 +375,27 @@ async def assign_tags(
     todo_id: int,
     body: TagAssign,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Todo:
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+    row = await conn.fetchrow(
+        "SELECT * FROM todos WHERE id = $1 AND user_id = $2", todo_id, user_id,
     )
-    row = await cursor.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Not Found")
     for tid in body.tag_ids:
-        cursor = await conn.execute(
-            "SELECT id FROM tags WHERE id = ? AND user_id = ?", (tid, user_id)
+        exists = await conn.fetchrow(
+            "SELECT id FROM tags WHERE id = $1 AND user_id = $2", tid, user_id,
         )
-        exists = await cursor.fetchone()
         if exists is None:
             raise HTTPException(
                 status_code=400, detail=f"Unknown tag_id: {tid}"
             )
     for tid in body.tag_ids:
         await conn.execute(
-            "INSERT OR IGNORE INTO todo_tags (todo_id, tag_id) VALUES (?, ?)",
-            (todo_id, tid),
+            "INSERT INTO todo_tags (todo_id, tag_id) VALUES ($1, $2) "
+            "ON CONFLICT DO NOTHING",
+            todo_id, tid,
         )
-    await conn.commit()
     tags = await get_tags_for_todo(conn, row["id"])
     todo = _row_to_todo(row, tags)
     await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})
@@ -415,25 +407,23 @@ async def remove_tag(
     todo_id: int,
     tag_id: int,
     user_id: int = Depends(authed_rate_limit),
-    conn: aiosqlite.Connection = Depends(get_db),
+    conn: asyncpg.Connection = Depends(get_db),
 ) -> Response:
-    cursor = await conn.execute(
-        "SELECT id FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+    todo_row = await conn.fetchrow(
+        "SELECT id FROM todos WHERE id = $1 AND user_id = $2", todo_id, user_id,
     )
-    todo_row = await cursor.fetchone()
     if todo_row is None:
         raise HTTPException(status_code=404, detail="Not Found")
-    cursor = await conn.execute(
-        "DELETE FROM todo_tags WHERE todo_id = ? AND tag_id = ?",
-        (todo_id, tag_id),
+    affected = await _delete_affected(
+        conn,
+        "DELETE FROM todo_tags WHERE todo_id = $1 AND tag_id = $2",
+        todo_id, tag_id,
     )
-    await conn.commit()
-    if cursor.rowcount == 0:
+    if affected == 0:
         raise HTTPException(status_code=404, detail="Not Found")
-    cursor = await conn.execute(
-        "SELECT * FROM todos WHERE id = ?", (todo_id,)
+    row = await conn.fetchrow(
+        "SELECT * FROM todos WHERE id = $1", todo_id,
     )
-    row = await cursor.fetchone()
     tags = await get_tags_for_todo(conn, todo_id)
     todo = _row_to_todo(row, tags)
     await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})

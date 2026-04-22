@@ -1,63 +1,91 @@
 from __future__ import annotations
 
+import asyncio
 import os
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
-import aiosqlite
+import asyncpg
 
 if TYPE_CHECKING:
     from todo_api.app import Tag, Todo
 
-DB_PATH: Path = Path(os.environ.get("TODO_DB_PATH", ":memory:"))
+_TESTING = "PYTEST_CURRENT_TEST" in os.environ
 
-IntegrityError = sqlite3.IntegrityError
+DATABASE_URL: str = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/test" if _TESTING else "",
+)
+
+if not DATABASE_URL and not _TESTING:
+    raise RuntimeError("DATABASE_URL environment variable is required")
+
+_pools: dict[int, asyncpg.Pool] = {}
 
 
-async def get_connection() -> aiosqlite.Connection:
-    conn = await aiosqlite.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+async def get_pool() -> asyncpg.Pool:
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    pool = _pools.get(loop_id)
+    if pool is None or pool._closed:
+        pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        _pools[loop_id] = pool
+    return pool
 
 
-async def init_schema(conn: aiosqlite.Connection) -> None:
+async def close_pool() -> None:
+    loop = asyncio.get_running_loop()
+    loop_id = id(loop)
+    pool = _pools.pop(loop_id, None)
+    if pool is not None:
+        await pool.close()
+
+
+def terminate_all_pools() -> None:
+    for pool in list(_pools.values()):
+        if not pool._closed:
+            try:
+                pool.terminate()
+            except Exception:
+                pass
+    _pools.clear()
+
+
+async def init_schema(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS users ("
-        "    id            INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "    email         TEXT    NOT NULL UNIQUE COLLATE NOCASE,"
-        "    password_hash TEXT    NOT NULL,"
-        "    created_at    TEXT    NOT NULL"
+        "    id            BIGSERIAL PRIMARY KEY,"
+        "    email         TEXT NOT NULL UNIQUE,"
+        "    password_hash TEXT NOT NULL,"
+        "    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()"
         ")"
     )
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS todos ("
-        "    id         INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
-        "    title      TEXT    NOT NULL,"
-        "    done       INTEGER NOT NULL DEFAULT 0,"
-        "    created_at TEXT    NOT NULL"
+        "    id         BIGSERIAL PRIMARY KEY,"
+        "    user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        "    title      TEXT NOT NULL,"
+        "    done       BOOLEAN NOT NULL DEFAULT FALSE,"
+        "    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
         ")"
     )
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS tags ("
-        "    id      INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
-        "    name    TEXT    NOT NULL COLLATE NOCASE,"
-        "    UNIQUE(user_id, name) ON CONFLICT ABORT"
+        "    id      BIGSERIAL PRIMARY KEY,"
+        "    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        "    name    TEXT NOT NULL"
         ")"
     )
     await conn.execute(
         "CREATE TABLE IF NOT EXISTS todo_tags ("
-        "    todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,"
-        "    tag_id  INTEGER NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,"
+        "    todo_id BIGINT NOT NULL REFERENCES todos(id) ON DELETE CASCADE,"
+        "    tag_id  BIGINT NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,"
         "    PRIMARY KEY (todo_id, tag_id)"
         ")"
     )
     await conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag_id)"
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_user_lower_name "
+        "ON tags (user_id, LOWER(name))"
     )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id)"
@@ -65,33 +93,44 @@ async def init_schema(conn: aiosqlite.Connection) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tags_user ON tags(user_id)"
     )
-    await conn.commit()
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag_id)"
+    )
 
 
-def _row_to_tag(row: aiosqlite.Row) -> Tag:
+async def get_db() -> AsyncIterator[asyncpg.Connection]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        yield conn
+
+
+def _row_to_tag(row: asyncpg.Record) -> Tag:
     from todo_api.app import Tag
 
     return Tag(id=row["id"], name=row["name"])
 
 
-async def get_tags_for_todo(conn: aiosqlite.Connection, todo_id: int) -> list[Tag]:
-    cursor = await conn.execute(
+async def get_tags_for_todo(conn: asyncpg.Connection, todo_id: int) -> list[Tag]:
+    rows = await conn.fetch(
         "SELECT t.id, t.name FROM tags t "
         "JOIN todo_tags tt ON tt.tag_id = t.id "
-        "WHERE tt.todo_id = ? ORDER BY t.id",
-        (todo_id,),
+        "WHERE tt.todo_id = $1 ORDER BY t.id",
+        todo_id,
     )
-    rows = await cursor.fetchall()
     return [_row_to_tag(r) for r in rows]
 
 
-def _row_to_todo(row: aiosqlite.Row, tags: list[Tag] | None = None) -> Todo:
+def _row_to_todo(row: asyncpg.Record, tags: list[Tag] | None = None) -> Todo:
     from todo_api.app import Todo
 
     return Todo(
         id=row["id"],
         title=row["title"],
-        done=bool(row["done"]),
-        created_at=datetime.fromisoformat(row["created_at"]),
+        done=row["done"],
+        created_at=row["created_at"],
         tags=tags if tags is not None else [],
     )
+
+
+async def _delete_affected(conn: asyncpg.Connection, sql: str, *args: object) -> int:
+    return int((await conn.execute(sql, *args)).split()[-1])
