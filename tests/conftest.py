@@ -1,5 +1,6 @@
 import uuid
 
+import asyncpg
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
@@ -11,13 +12,26 @@ from todo_api.app import app
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def isolated_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "test.db")
-    conn = await db_module.get_connection()
+async def isolated_state():
+    db_module.terminate_all_pools()
+
+    conn = await asyncpg.connect(db_module.DATABASE_URL)
     try:
+        has_tables = await conn.fetchval(
+            "SELECT EXISTS ("
+            "  SELECT FROM information_schema.tables "
+            "  WHERE table_schema = 'public' AND table_name = 'users'"
+            ")"
+        )
+        if has_tables:
+            await conn.execute(
+                "TRUNCATE TABLE todo_tags, tags, todos, users "
+                "RESTART IDENTITY CASCADE"
+            )
         await db_module.init_schema(conn)
     finally:
         await conn.close()
+
     rate_limit.reset_buckets()
     bus.reset()
 
