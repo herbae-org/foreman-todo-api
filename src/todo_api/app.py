@@ -1,9 +1,21 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 
-app = FastAPI()
+from todo_api.db import _row_to_todo, get_connection, init_schema
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    conn = get_connection()
+    init_schema(conn)
+    conn.close()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class TodoCreate(BaseModel):
@@ -34,13 +46,6 @@ class TodoStats(BaseModel):
     pending: int
 
 
-_todos: list[Todo] = []
-
-
-def _next_id() -> int:
-    return len(_todos) + 1
-
-
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -48,14 +53,18 @@ def health() -> dict[str, str]:
 
 @app.post("/todos", status_code=201)
 def create_todo(body: TodoCreate) -> Todo:
-    todo = Todo(
-        id=_next_id(),
-        title=body.title,
-        done=False,
-        created_at=datetime.now(timezone.utc),
+    now = datetime.now(timezone.utc)
+    conn = get_connection()
+    cursor = conn.execute(
+        "INSERT INTO todos (title, done, created_at) VALUES (?, 0, ?)",
+        (body.title, now.isoformat()),
     )
-    _todos.append(todo)
-    return todo
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM todos WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    conn.close()
+    return _row_to_todo(row)
 
 
 @app.get("/todos")
@@ -64,43 +73,71 @@ def list_todos(
     offset: int = Query(default=0, ge=0),
     done: bool | None = Query(default=None),
 ) -> TodoList:
-    if done is not None:
-        filtered = [t for t in _todos if t.done is done]
-    else:
-        filtered = list(_todos)
-    sorted_todos = sorted(filtered, key=lambda t: t.id, reverse=True)
-    page = sorted_todos[offset : offset + limit]
-    return TodoList(items=page, total=len(filtered))
+    conn = get_connection()
+    done_val = int(done) if done is not None else None
+    rows = conn.execute(
+        "SELECT * FROM todos WHERE (? IS NULL OR done = ?) "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (done_val, done_val, limit, offset),
+    ).fetchall()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM todos WHERE (? IS NULL OR done = ?)",
+        (done_val, done_val),
+    ).fetchone()[0]
+    conn.close()
+    return TodoList(items=[_row_to_todo(r) for r in rows], total=total)
 
 
 @app.get("/todos/stats")
 def get_stats() -> TodoStats:
-    done_count = sum(1 for t in _todos if t.done)
-    return TodoStats(total=len(_todos), done=done_count, pending=len(_todos) - done_count)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT COUNT(*) AS total, SUM(done) AS done FROM todos"
+    ).fetchone()
+    conn.close()
+    total = row["total"]
+    done_count = row["done"] or 0
+    return TodoStats(total=total, done=done_count, pending=total - done_count)
 
 
 @app.get("/todos/{todo_id}")
 def get_todo(todo_id: int) -> Todo:
-    for todo in _todos:
-        if todo.id == todo_id:
-            return todo
-    raise HTTPException(status_code=404, detail="Not Found")
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM todos WHERE id = ?", (todo_id,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return _row_to_todo(row)
 
 
 @app.patch("/todos/{todo_id}")
 def patch_todo(todo_id: int, body: PatchTodo) -> Todo:
-    for i, todo in enumerate(_todos):
-        if todo.id == todo_id:
-            updates = body.model_dump(exclude_none=True)
-            _todos[i] = todo.model_copy(update=updates)
-            return _todos[i]
-    raise HTTPException(status_code=404, detail="Not Found")
+    conn = get_connection()
+    done_val = int(body.done) if body.done is not None else None
+    cursor = conn.execute(
+        "UPDATE todos SET title = COALESCE(?, title), done = COALESCE(?, done) "
+        "WHERE id = ?",
+        (body.title, done_val, todo_id),
+    )
+    conn.commit()
+    if cursor.rowcount == 0:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Not Found")
+    row = conn.execute(
+        "SELECT * FROM todos WHERE id = ?", (todo_id,)
+    ).fetchone()
+    conn.close()
+    return _row_to_todo(row)
 
 
 @app.delete("/todos/{todo_id}", status_code=204)
 def delete_todo(todo_id: int) -> Response:
-    for i, todo in enumerate(_todos):
-        if todo.id == todo_id:
-            _todos.pop(i)
-            return Response(status_code=204)
-    raise HTTPException(status_code=404, detail="Not Found")
+    conn = get_connection()
+    cursor = conn.execute("DELETE FROM todos WHERE id = ?", (todo_id,))
+    conn.commit()
+    conn.close()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Not Found")
+    return Response(status_code=204)

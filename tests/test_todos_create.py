@@ -3,15 +3,16 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
-from todo_api import app as app_module
+from todo_api import db as db_module
 from todo_api.app import app
 
 client = TestClient(app)
 
 
 @pytest.fixture(autouse=True)
-def _reset_todos(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(app_module, "_todos", [])
+def isolated_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(db_module, "DB_PATH", tmp_path / "test.db")
+    db_module.init_schema(db_module.get_connection())
 
 
 def test_create_todo_returns_201_with_payload() -> None:
