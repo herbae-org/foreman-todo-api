@@ -11,12 +11,14 @@ dependencies = [
     "pydantic[email]>=2.6",
     "bcrypt>=4.0",
     "pyjwt>=2.8",
+    "aiosqlite>=0.19",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "httpx",
+    "pytest-asyncio>=0.23",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -24,3 +26,4 @@ packages = ["src/todo_api"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

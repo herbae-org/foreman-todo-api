@@ -88,22 +88,29 @@ def test_tag_name_can_collide_across_users() -> None:
     assert r2.status_code == 201
 
 
-def test_deleting_user_cascades_todos_and_tags() -> None:
+async def test_deleting_user_cascades_todos_and_tags() -> None:
     h = _make_user()
     _create_todo("t1", h)
     _create_todo("t2", h)
     _create_tag("tag1", h)
 
-    conn = db_module.get_connection()
-    user_row = conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1").fetchone()
-    user_id = user_row["id"]
+    conn = await db_module.get_connection()
+    try:
+        cursor = await conn.execute("SELECT id FROM users ORDER BY id DESC LIMIT 1")
+        user_row = await cursor.fetchone()
+        user_id = user_row["id"]
 
-    assert conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,)).fetchone()[0] == 2
-    assert conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,)).fetchone()[0] == 1
+        cursor = await conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,))
+        assert (await cursor.fetchone())[0] == 2
+        cursor = await conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,))
+        assert (await cursor.fetchone())[0] == 1
 
-    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
+        await conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        await conn.commit()
 
-    assert conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,)).fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,)).fetchone()[0] == 0
-    conn.close()
+        cursor = await conn.execute("SELECT COUNT(*) FROM todos WHERE user_id = ?", (user_id,))
+        assert (await cursor.fetchone())[0] == 0
+        cursor = await conn.execute("SELECT COUNT(*) FROM tags WHERE user_id = ?", (user_id,))
+        assert (await cursor.fetchone())[0] == 0
+    finally:
+        await conn.close()

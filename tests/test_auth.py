@@ -112,15 +112,18 @@ def test_me_unauthorized_with_expired_token() -> None:
     assert resp.status_code == 401
 
 
-def test_password_is_bcrypt_hashed_in_db() -> None:
+async def test_password_is_bcrypt_hashed_in_db() -> None:
     email = f"hash-{uuid.uuid4()}@example.com"
     password = "testpass123"
     _register(email, password)
-    conn = db_module.get_connection()
-    row = conn.execute(
-        "SELECT password_hash FROM users WHERE email = ?", (email,)
-    ).fetchone()
-    conn.close()
+    conn = await db_module.get_connection()
+    try:
+        cursor = await conn.execute(
+            "SELECT password_hash FROM users WHERE email = ?", (email,)
+        )
+        row = await cursor.fetchone()
+    finally:
+        await conn.close()
     assert row is not None
     assert row["password_hash"].startswith("$2b$")
     assert row["password_hash"] != password

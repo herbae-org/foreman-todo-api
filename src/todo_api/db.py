@@ -6,21 +6,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import aiosqlite
+
 if TYPE_CHECKING:
     from todo_api.app import Tag, Todo
 
 DB_PATH: Path = Path(os.environ.get("TODO_DB_PATH", ":memory:"))
 
+IntegrityError = sqlite3.IntegrityError
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
+
+async def get_connection() -> aiosqlite.Connection:
+    conn = await aiosqlite.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = aiosqlite.Row
+    await conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def init_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
+async def init_schema(conn: aiosqlite.Connection) -> None:
+    await conn.execute(
         "CREATE TABLE IF NOT EXISTS users ("
         "    id            INTEGER PRIMARY KEY AUTOINCREMENT,"
         "    email         TEXT    NOT NULL UNIQUE COLLATE NOCASE,"
@@ -28,7 +32,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         "    created_at    TEXT    NOT NULL"
         ")"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE TABLE IF NOT EXISTS todos ("
         "    id         INTEGER PRIMARY KEY AUTOINCREMENT,"
         "    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
@@ -37,7 +41,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
         "    created_at TEXT    NOT NULL"
         ")"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE TABLE IF NOT EXISTS tags ("
         "    id      INTEGER PRIMARY KEY AUTOINCREMENT,"
         "    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
@@ -45,42 +49,43 @@ def init_schema(conn: sqlite3.Connection) -> None:
         "    UNIQUE(user_id, name) ON CONFLICT ABORT"
         ")"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE TABLE IF NOT EXISTS todo_tags ("
         "    todo_id INTEGER NOT NULL REFERENCES todos(id) ON DELETE CASCADE,"
         "    tag_id  INTEGER NOT NULL REFERENCES tags(id)  ON DELETE CASCADE,"
         "    PRIMARY KEY (todo_id, tag_id)"
         ")"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag_id)"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id)"
     )
-    conn.execute(
+    await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tags_user ON tags(user_id)"
     )
-    conn.commit()
+    await conn.commit()
 
 
-def _row_to_tag(row: sqlite3.Row) -> Tag:
+def _row_to_tag(row: aiosqlite.Row) -> Tag:
     from todo_api.app import Tag
 
     return Tag(id=row["id"], name=row["name"])
 
 
-def get_tags_for_todo(conn: sqlite3.Connection, todo_id: int) -> list[Tag]:
-    rows = conn.execute(
+async def get_tags_for_todo(conn: aiosqlite.Connection, todo_id: int) -> list[Tag]:
+    cursor = await conn.execute(
         "SELECT t.id, t.name FROM tags t "
         "JOIN todo_tags tt ON tt.tag_id = t.id "
         "WHERE tt.todo_id = ? ORDER BY t.id",
         (todo_id,),
-    ).fetchall()
+    )
+    rows = await cursor.fetchall()
     return [_row_to_tag(r) for r in rows]
 
 
-def _row_to_todo(row: sqlite3.Row, conn: sqlite3.Connection) -> Todo:
+def _row_to_todo(row: aiosqlite.Row, tags: list[Tag] | None = None) -> Todo:
     from todo_api.app import Todo
 
     return Todo(
@@ -88,5 +93,5 @@ def _row_to_todo(row: sqlite3.Row, conn: sqlite3.Connection) -> Todo:
         title=row["title"],
         done=bool(row["done"]),
         created_at=datetime.fromisoformat(row["created_at"]),
-        tags=get_tags_for_todo(conn, row["id"]),
+        tags=tags if tags is not None else [],
     )

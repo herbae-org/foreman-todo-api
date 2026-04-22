@@ -43,7 +43,7 @@ def decode_token(token: str) -> int:
     return int(payload["sub"])
 
 
-def get_current_user(authorization: str | None = Header(default=None)) -> int:
+async def get_current_user(authorization: str | None = Header(default=None)) -> int:
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
     token = authorization.removeprefix("Bearer ")
@@ -51,9 +51,12 @@ def get_current_user(authorization: str | None = Header(default=None)) -> int:
         user_id = decode_token(token)
     except (jwt.InvalidTokenError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Invalid or missing token")
-    conn = get_connection()
-    row = conn.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
-    conn.close()
+    conn = await get_connection()
+    try:
+        cursor = await conn.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        row = await cursor.fetchone()
+    finally:
+        await conn.close()
     if row is None:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
     return user_id
