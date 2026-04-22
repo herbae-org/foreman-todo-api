@@ -1,12 +1,12 @@
 name: '[AUTOAGENT] Fixer'
 
 on:
-  # schedule:
-  #   - cron: '15,45 1-22 * * *'  # Every 30 min at :15 and :45 (skip 23:00-01:00 UTC)
+  schedule:
+    - cron: '*/10 * * * *'  # Every 10 min — tight cadence for the playground.
 
   # Auto-trigger on failed CI for autoagent branches
-  # check_suite:
-  #   types: [completed]
+  check_suite:
+    types: [completed]
 
   workflow_dispatch:
     inputs:
