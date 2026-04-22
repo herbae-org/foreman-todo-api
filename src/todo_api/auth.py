@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 import bcrypt
 import jwt
-from fastapi import Header, HTTPException
+from fastapi import Header, HTTPException, WebSocket, status
+from fastapi.exceptions import WebSocketException
 
 from todo_api.db import get_connection
 
@@ -60,3 +61,13 @@ async def get_current_user(authorization: str | None = Header(default=None)) -> 
     if row is None:
         raise HTTPException(status_code=401, detail="Invalid or missing token")
     return user_id
+
+
+def decode_token_from_ws_headers(ws: WebSocket) -> int:
+    auth = ws.headers.get("authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
+    try:
+        return decode_token(auth.removeprefix("Bearer "))
+    except (jwt.InvalidTokenError, KeyError, ValueError):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)

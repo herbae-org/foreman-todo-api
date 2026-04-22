@@ -3,16 +3,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import aiosqlite
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, EmailStr, Field
 
 from todo_api.auth import (
     JWT_EXPIRY_SECONDS,
     create_token,
+    decode_token_from_ws_headers,
     get_current_user,
     hash_password,
     verify_password,
 )
+from todo_api.events import bus
 from todo_api.db import (
     IntegrityError,
     _row_to_tag,
@@ -198,7 +200,9 @@ async def create_todo(
     )
     row = await cursor.fetchone()
     tags = await get_tags_for_todo(conn, row["id"])
-    return _row_to_todo(row, tags)
+    todo = _row_to_todo(row, tags)
+    await bus.publish(user_id, {"type": "created", "todo": todo.model_dump(mode="json")})
+    return todo
 
 
 @app.get("/todos")
@@ -294,7 +298,9 @@ async def patch_todo(
     )
     row = await cursor.fetchone()
     tags = await get_tags_for_todo(conn, row["id"])
-    return _row_to_todo(row, tags)
+    todo = _row_to_todo(row, tags)
+    await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})
+    return todo
 
 
 @app.delete("/todos/{todo_id}", status_code=204)
@@ -304,11 +310,18 @@ async def delete_todo(
     conn: aiosqlite.Connection = Depends(get_db),
 ) -> Response:
     cursor = await conn.execute(
-        "DELETE FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+        "SELECT * FROM todos WHERE id = ? AND user_id = ?", (todo_id, user_id)
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Not Found")
+    tags = await get_tags_for_todo(conn, row["id"])
+    pre_delete_todo = _row_to_todo(row, tags)
+    await conn.execute(
+        "DELETE FROM todos WHERE id = ?", (todo_id,)
     )
     await conn.commit()
-    if cursor.rowcount == 0:
-        raise HTTPException(status_code=404, detail="Not Found")
+    await bus.publish(user_id, {"type": "deleted", "todo": pre_delete_todo.model_dump(mode="json")})
     return Response(status_code=204)
 
 
@@ -392,7 +405,9 @@ async def assign_tags(
         )
     await conn.commit()
     tags = await get_tags_for_todo(conn, row["id"])
-    return _row_to_todo(row, tags)
+    todo = _row_to_todo(row, tags)
+    await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})
+    return todo
 
 
 @app.delete("/todos/{todo_id}/tags/{tag_id}", status_code=204)
@@ -415,4 +430,31 @@ async def remove_tag(
     await conn.commit()
     if cursor.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not Found")
+    cursor = await conn.execute(
+        "SELECT * FROM todos WHERE id = ?", (todo_id,)
+    )
+    row = await cursor.fetchone()
+    tags = await get_tags_for_todo(conn, todo_id)
+    todo = _row_to_todo(row, tags)
+    await bus.publish(user_id, {"type": "updated", "todo": todo.model_dump(mode="json")})
     return Response(status_code=204)
+
+
+# --- WebSocket ---
+
+@app.websocket("/ws/todos")
+async def todos_stream(ws: WebSocket) -> None:
+    user_id = decode_token_from_ws_headers(ws)
+    await ws.accept()
+    await ws.send_json({"type": "hello", "user_id": user_id})
+    queue = bus.subscribe(user_id)
+    try:
+        while True:
+            event = await queue.get()
+            await ws.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        await ws.close(code=1011, reason="internal error")
+    finally:
+        bus.unsubscribe(user_id, queue)
