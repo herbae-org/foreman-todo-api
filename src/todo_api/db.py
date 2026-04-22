@@ -21,8 +21,17 @@ def get_connection() -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
+        "CREATE TABLE IF NOT EXISTS users ("
+        "    id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    email         TEXT    NOT NULL UNIQUE COLLATE NOCASE,"
+        "    password_hash TEXT    NOT NULL,"
+        "    created_at    TEXT    NOT NULL"
+        ")"
+    )
+    conn.execute(
         "CREATE TABLE IF NOT EXISTS todos ("
         "    id         INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
         "    title      TEXT    NOT NULL,"
         "    done       INTEGER NOT NULL DEFAULT 0,"
         "    created_at TEXT    NOT NULL"
@@ -30,8 +39,10 @@ def init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tags ("
-        "    id   INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "    name TEXT    NOT NULL UNIQUE COLLATE NOCASE"
+        "    id      INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+        "    name    TEXT    NOT NULL COLLATE NOCASE,"
+        "    UNIQUE(user_id, name) ON CONFLICT ABORT"
         ")"
     )
     conn.execute(
@@ -43,6 +54,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_todo_tags_tag ON todo_tags(tag_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_todos_user ON todos(user_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tags_user ON tags(user_id)"
     )
     conn.commit()
 
